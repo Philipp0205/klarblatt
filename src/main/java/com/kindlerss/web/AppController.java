@@ -1,0 +1,555 @@
+package com.kindlerss.web;
+
+import com.kindlerss.config.AppProperties;
+import com.kindlerss.domain.Article;
+import com.kindlerss.domain.Feed;
+import com.kindlerss.security.CurrentUser;
+import com.kindlerss.service.ArticleService;
+import com.kindlerss.service.FeedService;
+import com.kindlerss.service.KindleMailService;
+import com.kindlerss.service.UserService;
+import org.springframework.stereotype.Controller;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.servlet.mvc.support.RedirectAttributes;
+
+import jakarta.servlet.http.HttpServletRequest;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.time.Instant;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+
+/** MVC endpoints for feeds, articles, and Kindle send actions. */
+@Controller
+public class AppController {
+
+    /** How much of a feed title a filter button carries. */
+    private static final int FILTER_LABEL_MAX = 18;
+
+    /** Feeds that were never put in a category are browsed last. */
+    private static final Comparator<String> CATEGORY_ORDER =
+            Comparator.comparing((String name) -> Feed.UNCATEGORIZED.equals(name))
+                    .thenComparing(Comparator.<String>naturalOrder());
+
+    private final FeedService feedService;
+    private final ArticleService articleService;
+    private final KindleMailService kindleMailService;
+    private final UserService userService;
+    private final CurrentUser currentUser;
+    private final AppProperties properties;
+    private final int pageSize;
+    private final String mailFrom;
+
+    public AppController(FeedService feedService,
+                         ArticleService articleService,
+                         KindleMailService kindleMailService,
+                         UserService userService,
+                         CurrentUser currentUser,
+                         AppProperties properties) {
+        this.feedService = feedService;
+        this.articleService = articleService;
+        this.kindleMailService = kindleMailService;
+        this.userService = userService;
+        this.currentUser = currentUser;
+        this.properties = properties;
+        this.pageSize = properties.articles().pageSize();
+        this.mailFrom = properties.mailFrom();
+    }
+
+    @GetMapping("/")
+    public String home(@RequestParam(value = "view", defaultValue = "feeds") String view,
+                       @RequestParam(value = "category", required = false) String category,
+                       Model model) {
+        long userId = currentUser.requireId();
+        List<Feed> feeds = feedService.listFeeds(userId);
+        long totalUnread = feeds.stream().mapToLong(Feed::unreadCount).sum();
+        model.addAttribute("feeds", feeds);
+        Map<String, List<Feed>> feedGroups = new LinkedHashMap<>();
+        for (Feed feed : feeds) {
+            feedGroups.computeIfAbsent(feed.categoryName(), ignored -> new ArrayList<>()).add(feed);
+        }
+        model.addAttribute("feedGroups", feedGroups);
+        List<String> categories = existingCategories(feeds);
+        model.addAttribute("categories", categories);
+        model.addAttribute("defaultFeeds", feedService.defaultFeeds(userId));
+        model.addAttribute("totalUnread", totalUnread);
+        String selectedCategory = category == null ? null : category.trim();
+        if (selectedCategory != null && !categories.contains(selectedCategory)
+                && !Feed.UNCATEGORIZED.equals(selectedCategory)) {
+            selectedCategory = null;
+        }
+        String activeView = selectedCategory != null ? "category"
+                : switch (view) {
+                    case "add", "free-test" -> view;
+                    default -> "feeds";
+                };
+        model.addAttribute("activeView", activeView);
+        model.addAttribute("selectedCategory", selectedCategory);
+        model.addAttribute("kindleConfigured", isKindleConfigured(userId));
+        model.addAttribute("mailFrom", mailFrom);
+        boolean newslettersEnabled = properties.newsletters().enabled();
+        model.addAttribute("newslettersEnabled", newslettersEnabled);
+        if (newslettersEnabled) {
+            String token = userService.ensureNewsletterInboundToken(userId);
+            model.addAttribute("newsletterAddress", token + "@" + properties.newsletters().inboundDomain());
+        }
+        return "index";
+    }
+
+    /** The distinct categories already in use, so they can fill a category drop-down. */
+    private static List<String> existingCategories(List<Feed> feeds) {
+        return feeds.stream()
+                .map(Feed::category)
+                .filter(name -> name != null && !name.isBlank())
+                .map(String::trim)
+                .distinct()
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .toList();
+    }
+
+    private boolean isKindleConfigured(long userId) {
+        return userService.findById(userId)
+                .map(user -> user.kindleEmail() != null && !user.kindleEmail().isBlank())
+                .orElse(false);
+    }
+
+    @PostMapping("/feeds")
+    public String addFeed(@RequestParam("url") String url,
+                          @RequestParam(value = "category", required = false) String category,
+                          @RequestParam(value = "newCategory", required = false) String newCategory,
+                          RedirectAttributes redirectAttributes) {
+        try {
+            Feed feed = feedService.addFeed(currentUser.requireId(), url, resolveCategory(category, newCategory));
+            redirectAttributes.addFlashAttribute("message", "Added feed: " + feed.title());
+        } catch (Exception e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+        }
+        return "redirect:/";
+    }
+
+    @PostMapping("/feeds/defaults")
+    public String addDefaultFeeds(@RequestParam(value = "feed", required = false) List<String> keys,
+                                  RedirectAttributes redirectAttributes) {
+        if (keys == null || keys.isEmpty()) {
+            redirectAttributes.addFlashAttribute("error", "Choose at least one suggested feed");
+            return "redirect:/";
+        }
+        long userId = currentUser.requireId();
+        int added = 0;
+        java.util.ArrayList<String> errors = new java.util.ArrayList<>();
+        for (String key : keys) {
+            var suggestion = feedService.defaultFeed(key);
+            if (suggestion.isEmpty()) {
+                errors.add("Unknown suggested feed: " + key);
+                continue;
+            }
+            try {
+                var feed = suggestion.get();
+                feedService.addFeed(userId, feed.url(), feed.category());
+                added++;
+            } catch (Exception e) {
+                errors.add(suggestion.get().title() + ": " + e.getMessage());
+            }
+        }
+        if (added > 0) {
+            redirectAttributes.addFlashAttribute("message",
+                    added == 1 ? "Added 1 suggested feed" : "Added " + added + " suggested feeds");
+        }
+        if (!errors.isEmpty()) {
+            redirectAttributes.addFlashAttribute("error", String.join("; ", errors));
+        }
+        return "redirect:/";
+    }
+
+    /**
+     * Fetches a pasted page, stores it as an article, and emails the EPUB. The
+     * article is kept even when sending fails, so a Kindle address that is not
+     * set yet can be filled in and the send retried from the article page.
+     */
+    @PostMapping("/articles/from-url")
+    public String sendFromUrl(@RequestParam("url") String url,
+                              @RequestParam(value = "images", defaultValue = "false") boolean images,
+                              HttpServletRequest request,
+                              RedirectAttributes redirectAttributes) {
+        boolean accessible = EditionInterceptor.isAccessible(request);
+        String failureTarget = accessible ? "/topics" : "/";
+        Article article;
+        try {
+            article = articleService.importFromUrl(currentUser.requireId(), url);
+        } catch (Exception e) {
+            redirectAttributes.addFlashAttribute("error",
+                    e.getMessage() == null ? "That page could not be sent" : e.getMessage());
+            return "redirect:" + failureTarget;
+        }
+        String successTarget = accessible
+                ? "/read/" + article.id()
+                : "/articles/" + article.id() + (images ? "?images=true" : "");
+        try {
+            boolean donationPrompt = kindleMailService.sendToKindle(
+                    currentUser.requireId(), article.id(), images);
+            redirectAttributes.addFlashAttribute("message", "Sent to Kindle");
+            if (donationPrompt) {
+                redirectAttributes.addFlashAttribute("donationPrompt", true);
+            }
+        } catch (Exception e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+        }
+        return "redirect:" + successTarget;
+    }
+
+    @PostMapping("/feeds/{id}/category")
+    public String categorizeFeed(@PathVariable("id") long id,
+                                 @RequestParam(value = "category", required = false) String category,
+                                 @RequestParam(value = "newCategory", required = false) String newCategory,
+                                 RedirectAttributes redirectAttributes) {
+        if (feedService.categorizeFeed(currentUser.requireId(), id, resolveCategory(category, newCategory))) {
+            redirectAttributes.addFlashAttribute("message", "Feed category updated");
+        } else {
+            redirectAttributes.addFlashAttribute("error", "Feed not found");
+        }
+        return "redirect:/";
+    }
+
+    /**
+     * The category comes from a drop-down of the categories already in use, plus a
+     * "New category" choice that reveals a text field. A typed new name wins; the
+     * sentinel value and the blank "Uncategorized" choice both mean no category.
+     */
+    static final String NEW_CATEGORY = "__new__";
+
+    static String resolveCategory(String category, String newCategory) {
+        if (newCategory != null && !newCategory.isBlank()) {
+            return newCategory.trim();
+        }
+        if (category == null || category.isBlank() || NEW_CATEGORY.equals(category.trim())) {
+            return null;
+        }
+        return category.trim();
+    }
+
+    @PostMapping("/categories/rename")
+    public String renameCategory(@RequestParam("oldCategory") String oldCategory,
+                                 @RequestParam("newCategory") String newCategory,
+                                 RedirectAttributes redirectAttributes) {
+        try {
+            int updated = feedService.renameCategory(currentUser.requireId(), oldCategory, newCategory);
+            redirectAttributes.addFlashAttribute("message", updated == 0
+                    ? "No feeds found in that category"
+                    : "Renamed category for " + updated + (updated == 1 ? " feed" : " feeds"));
+        } catch (IllegalArgumentException e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+        }
+        return "redirect:/";
+    }
+
+    @PostMapping("/feeds/{id}/delete")
+    public String deleteFeed(@PathVariable("id") long id, RedirectAttributes redirectAttributes) {
+        if (!feedService.deleteFeed(currentUser.requireId(), id)) {
+            redirectAttributes.addFlashAttribute("error", "Feed not found");
+        } else {
+            redirectAttributes.addFlashAttribute("message", "Feed deleted");
+        }
+        return "redirect:/";
+    }
+
+    @PostMapping("/refresh")
+    public String refresh(@RequestParam(value = "redirect", defaultValue = "/") String redirect,
+                          RedirectAttributes redirectAttributes) {
+        try {
+            feedService.refreshForUser(currentUser.requireId());
+            redirectAttributes.addFlashAttribute("message", "Feeds refreshed");
+        } catch (Exception e) {
+            redirectAttributes.addFlashAttribute("error", "Refresh failed: " + e.getMessage());
+        }
+        return "redirect:" + safeRedirect(redirect);
+    }
+
+    @GetMapping("/items")
+    public String items(@RequestParam(value = "feed", required = false) Long feedId,
+                        @RequestParam(value = "category", required = false) String category,
+                        @RequestParam(value = "unread", required = false) Boolean unread,
+                        @RequestParam(value = "snapshot", required = false) Long snapshot,
+                        @RequestParam(value = "page", defaultValue = "1") int page,
+                        Model model) {
+        long userId = currentUser.requireId();
+        if (feedId != null && feedService.findById(userId, feedId).isEmpty()) {
+            throw new ArticleService.NotFoundException("Feed not found");
+        }
+        boolean unreadByDefault = unread == null || Boolean.TRUE.equals(unread);
+        Boolean unreadOnly = unreadByDefault ? Boolean.TRUE : null;
+        if (unreadByDefault && snapshot == null) {
+            return "redirect:" + itemsPath(feedId, category, true, Math.max(page, 1),
+                    System.currentTimeMillis());
+        }
+        Instant unreadSnapshot = unreadByDefault && snapshot != null
+                ? Instant.ofEpochMilli(Math.min(snapshot, System.currentTimeMillis())) : null;
+        long total = category == null && unreadSnapshot == null
+                ? articleService.count(userId, feedId, unreadOnly)
+                : articleService.count(userId, feedId, category, unreadOnly, unreadSnapshot);
+        int totalPages = (int) Math.max(1, (total + pageSize - 1) / pageSize);
+        // Marking a page read shrinks an unread list, so a page number can end up
+        // past the end; show the last page rather than an empty one.
+        int safePage = Math.min(Math.max(page, 1), totalPages);
+        List<Article> articles = category == null && unreadSnapshot == null
+                ? articleService.findPage(userId, feedId, unreadOnly, safePage, pageSize)
+                : articleService.findPage(userId, feedId, category, unreadOnly, unreadSnapshot, safePage, pageSize);
+
+        model.addAttribute("articles", articles);
+        addFilterBar(model, feedService.listFeeds(userId), feedId, category, unreadByDefault);
+        model.addAttribute("feedId", feedId);
+        model.addAttribute("category", category);
+        model.addAttribute("unread", unreadByDefault);
+        model.addAttribute("snapshot", snapshot);
+        model.addAttribute("page", safePage);
+        model.addAttribute("totalPages", totalPages);
+        model.addAttribute("total", total);
+        // Where an action started from, so that it can return to this exact list.
+        model.addAttribute("listPath",
+                itemsPath(feedId, category, unreadByDefault, safePage, snapshot));
+        model.addAttribute("firstIndex", articles.isEmpty() ? 0 : (long) (safePage - 1) * pageSize + 1);
+        model.addAttribute("lastIndex", (long) (safePage - 1) * pageSize + articles.size());
+        return "items";
+    }
+
+    /**
+     * The filter bar browses categories first and only opens up the feeds of the
+     * category that is being read, because a list of every feed is both longer than
+     * the screen is wide and rarely what is wanted.
+     *
+     * <p>Both rows are rendered whole; a row too long for the screen is turned a page
+     * at a time in the browser, where the buttons can actually be measured.
+     */
+    private void addFilterBar(Model model, List<Feed> feeds, Long feedId, String category,
+                              boolean unread) {
+        String activeCategory = category != null && !category.isBlank() ? category.trim() : null;
+        if (activeCategory == null && feedId != null) {
+            activeCategory = feeds.stream()
+                    .filter(feed -> feedId.equals(feed.id()))
+                    .map(Feed::categoryName)
+                    .findFirst().orElse(null);
+        }
+
+        List<FilterChip> categoryChips = new ArrayList<>();
+        categoryChips.add(new FilterChip("All", filterLink(null, null, unread),
+                feedId == null && activeCategory == null));
+        categoryChips.add(new FilterChip("Unread", filterLink(feedId, category, !unread), unread));
+        for (String name : feeds.stream().map(Feed::categoryName).distinct().sorted(CATEGORY_ORDER).toList()) {
+            categoryChips.add(new FilterChip(name, filterLink(null, name, unread), name.equals(activeCategory)));
+        }
+
+        List<FilterChip> feedChips = new ArrayList<>();
+        String openCategory = activeCategory;
+        if (openCategory != null) {
+            for (Feed feed : feeds) {
+                if (openCategory.equals(feed.categoryName())) {
+                    feedChips.add(new FilterChip(chipLabel(feed.title()),
+                            filterLink(feed.id(), null, unread),
+                            feed.id() != null && feed.id().equals(feedId)));
+                }
+            }
+        }
+
+        model.addAttribute("categoryChips", categoryChips);
+        model.addAttribute("feedChips", feedChips);
+        model.addAttribute("filterLabel", feedId != null
+                ? feeds.stream().filter(feed -> feedId.equals(feed.id())).map(Feed::title).findFirst().orElse(null)
+                : activeCategory);
+    }
+
+    /**
+     * A filter button starts its list fresh: at the first page, and for an unread list
+     * without the snapshot of the list left behind, which belongs to other articles.
+     */
+    private static String filterLink(Long feedId, String category, boolean unread) {
+        StringBuilder query = new StringBuilder();
+        appendParam(query, "feed", feedId == null ? null : String.valueOf(feedId));
+        appendParam(query, "category", category);
+        appendParam(query, "unread", String.valueOf(unread));
+        return query.isEmpty() ? "/items" : "/items?" + query;
+    }
+
+    private static void appendParam(StringBuilder query, String name, String value) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        if (!query.isEmpty()) {
+            query.append('&');
+        }
+        query.append(name).append('=').append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+    }
+
+    /** Feed titles are names, not sentences: enough of one to recognise it is enough. */
+    private static String chipLabel(String title) {
+        String value = title == null || title.isBlank() ? "Untitled" : title.trim();
+        return value.length() <= FILTER_LABEL_MAX
+                ? value
+                : value.substring(0, FILTER_LABEL_MAX - 1).trim() + "…";
+    }
+
+    /** One button of the filter bar: the whole list, a category, or a single feed. */
+    public record FilterChip(String label, String href, boolean active) {}
+
+    /**
+     * Marks the articles of the current list page read and moves on, so a list can be
+     * worked through by paging instead of marking every article by hand.
+     *
+     * <p>An unread list shrinks by exactly the articles that were just marked, which
+     * shifts the following ones into the page that was posted from — so that page,
+     * not the next one, holds what comes next.
+     */
+    @PostMapping("/items/advance")
+    public String advance(@RequestParam(value = "feed", required = false) Long feedId,
+                          @RequestParam(value = "category", required = false) String category,
+                          @RequestParam(value = "unread", required = false) Boolean unread,
+                          @RequestParam(value = "snapshot", required = false) Long snapshot,
+                          @RequestParam(value = "page", defaultValue = "1") int page,
+                          @RequestParam(value = "id", required = false) List<Long> ids,
+                          RedirectAttributes redirectAttributes) {
+        int marked = ids == null || ids.isEmpty() ? 0
+                : articleService.markRead(currentUser.requireId(), ids, true);
+        redirectAttributes.addFlashAttribute("message", marked == 0
+                ? "Nothing left to mark as read"
+                : marked == 1 ? "1 article marked as read" : marked + " articles marked as read");
+
+        boolean unreadOnly = Boolean.TRUE.equals(unread);
+        int current = Math.max(page, 1);
+        return "redirect:" + itemsPath(
+                feedId, category, unreadOnly, unreadOnly ? current : current + 1, snapshot) + "#start";
+    }
+
+    static String itemsPath(Long feedId, boolean unread, int page) {
+        return itemsPath(feedId, null, unread, page, null);
+    }
+
+    static String itemsPath(Long feedId, String category, boolean unread, int page, Long snapshot) {
+        StringBuilder path = new StringBuilder("/items?page=").append(Math.max(page, 1));
+        if (feedId != null) {
+            path.append("&feed=").append(feedId);
+        }
+        if (category != null && !category.isBlank()) {
+            path.append("&category=").append(URLEncoder.encode(category, StandardCharsets.UTF_8));
+        }
+        path.append("&unread=").append(unread);
+        if (unread) {
+            if (snapshot != null) {
+                path.append("&snapshot=").append(snapshot);
+            }
+        }
+        return path.toString();
+    }
+
+    @GetMapping("/articles/{id}")
+    public String article(@PathVariable("id") long id,
+                          @RequestParam(value = "images", defaultValue = "false") boolean images,
+                          Model model) {
+        long userId = currentUser.requireId();
+        Article article = articleService.findById(userId, id)
+                .orElseThrow(() -> new ArticleService.NotFoundException("Article not found"));
+        if (!article.read()) {
+            articleService.markRead(userId, id, true);
+            article = articleService.findById(userId, id).orElse(article);
+        }
+        String contentHtml = articleService.getContentHtml(article, images);
+        model.addAttribute("article", article);
+        model.addAttribute("contentHtml", contentHtml);
+        model.addAttribute("images", images);
+        model.addAttribute("originalUrl", safeHttpUrl(article.url()));
+        model.addAttribute("commentsUrl",
+                articleService.findCommentsUrl(article).map(AppController::safeHttpUrl).orElse(null));
+        return "article";
+    }
+
+    @PostMapping("/articles/{id}/read")
+    public String markRead(@PathVariable("id") long id,
+                           @RequestParam(value = "read", defaultValue = "true") boolean read,
+                           @RequestParam(value = "redirect", defaultValue = "/items") String redirect,
+                           RedirectAttributes redirectAttributes) {
+        try {
+            articleService.markRead(currentUser.requireId(), id, read);
+            redirectAttributes.addFlashAttribute("message", read ? "Marked as read" : "Marked as unread");
+        } catch (ArticleService.NotFoundException e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+            return "redirect:/items";
+        }
+        return "redirect:" + safeRedirect(redirect);
+    }
+
+    /**
+     * Sending goes back to where it was started: to the article when it was being
+     * read, and to the list when it was picked out of the list, which would
+     * otherwise open an article nobody asked to read.
+     */
+    @PostMapping("/articles/{id}/send")
+    public String send(@PathVariable("id") long id,
+                       @RequestParam(value = "images", defaultValue = "false") boolean images,
+                       @RequestParam(value = "redirect", required = false) String redirect,
+                       RedirectAttributes redirectAttributes) {
+        String target = redirect == null || redirect.isBlank()
+                ? "/articles/" + id + (images ? "?images=true" : "")
+                : safeRedirect(redirect);
+        try {
+            boolean donationPrompt = kindleMailService.sendToKindle(currentUser.requireId(), id, images);
+            redirectAttributes.addFlashAttribute("message", "Sent to Kindle");
+            if (donationPrompt) {
+                redirectAttributes.addFlashAttribute("donationPrompt", true);
+            }
+        } catch (ArticleService.NotFoundException e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+            return "redirect:/items";
+        } catch (Exception e) {
+            redirectAttributes.addFlashAttribute("error", e.getMessage());
+        }
+        return "redirect:" + target;
+    }
+
+    @PostMapping("/articles/{id}/send-async")
+    public ResponseEntity<Map<String, Object>> sendAsync(
+            @PathVariable("id") long id,
+            @RequestParam(value = "images", defaultValue = "false") boolean images) {
+        try {
+            boolean donationPrompt = kindleMailService.sendToKindle(currentUser.requireId(), id, images);
+            return ResponseEntity.ok(Map.of("message", "Sent to Kindle", "donationPrompt", donationPrompt));
+        } catch (ArticleService.NotFoundException e) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", e.getMessage() == null ? "Could not send article" : e.getMessage()));
+        }
+    }
+
+    /**
+     * Prevent open redirects: only allow relative in-app paths.
+     */
+    static String safeRedirect(String redirect) {
+        if (redirect == null || redirect.isBlank()) {
+            return "/items";
+        }
+        String value = redirect.trim();
+        if (!value.startsWith("/") || value.startsWith("//") || value.contains("://")) {
+            return "/items";
+        }
+        return value;
+    }
+
+    static String safeHttpUrl(String url) {
+        if (url == null || url.isBlank()) {
+            return null;
+        }
+        String trimmed = url.trim();
+        String lower = trimmed.toLowerCase();
+        if (lower.startsWith("https://") || lower.startsWith("http://")) {
+            return trimmed;
+        }
+        return null;
+    }
+}
