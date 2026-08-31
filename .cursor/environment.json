@@ -1,0 +1,12 @@
+{
+  "name": "Klarblatt",
+  "install": "./mvnw -B -DskipTests package",
+  "start": "./.cursor/start.sh",
+  "terminals": [
+    {
+      "name": "app",
+      "command": "set -a; source .cursor/dev.env; set +a; ./mvnw spring-boot:run"
+    }
+  ],
+  "ports": [8080, 8025]
+}
